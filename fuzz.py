@@ -2,7 +2,10 @@
 from ptrace.debugger.debugger import PtraceDebugger
 from ptrace.debugger.child import createChild
 from ptrace.tools import locateProgram
+from ptrace.debugger.process import NewProcessEvent
 from sys import stderr, argv, exit
+
+from ptrace.binding import func as ptrace_bindings
 
 def playWithProcess(process):
     process.cont()
@@ -48,39 +51,79 @@ def allocateMemory(process):
 	print hex(mem)
 	return mem
 
-def main():
-    # User asked to create a new program and trace it
-    arguments = argv[2:]
-    pid = traceProgram(arguments)
-    is_attached = True
+def createCheckpoint(process):
 
-    # Create the debugger and attach the process
-    dbg = PtraceDebugger()
-    process = dbg.addProcess(pid, is_attached)
+    syscall_opcode = "\xCD\x80"
+    fork_syscall_nr = 2
 
-    process.createBreakpoint(int(argv[1], 16), None)
+    eip = process.getreg("eip")
+    old_eax = process.getreg("eax")
+    old_instrs = process.readBytes(eip, len(syscall_opcode))
+    process.writeBytes(eip, syscall_opcode)
+    process.setreg("eax", fork_syscall_nr)
 
-    mem = allocateMemory(process)
+    child = None
 
-    playWithProcess(process)
+    process.singleStep()
+    ev = process.waitEvent()
 
-    ip = process.getInstrPointer() - 1
-    breakpoint = process.findBreakpoint(ip)
-    if breakpoint:
-        print ("Stopped at %s" % breakpoint)
-        breakpoint.desinstall(set_ip=True)
+    child = ev.process
 
-    new_str_addr = mem + 0x100
-    arg_addr = process.getreg("esp") + 4
-    arg = process.readWord(arg_addr)
-    print process.readCString(arg, 10)
-    process.writeBytes(new_str_addr, "01234567890")
-    process.writeWord(arg_addr, new_str_addr)
-    arg = process.readWord(arg_addr)
-    print process.readCString(arg, 10)
+    process.setreg("eax", old_eax)
+    process.setInstrPointer(eip)
+    process.writeBytes(eip, old_instrs)
 
-    playWithProcess(process)
-    dbg.quit()
+    child.setreg("eax", old_eax)
+    child.setInstrPointer(eip)
+    child.writeBytes(eip, old_instrs)
+
+    return child
+	
+class Fuzz(object):
+
+	def try_arg(self, str_argument):
+	
+		print "Trying argument %s" % str_argument
+	
+		process = self.test_process
+		new_str_addr = self.mem + 0x100
+		arg_addr = process.getreg("esp") + 4
+		arg = process.readWord(arg_addr)
+		process.writeBytes(new_str_addr, str_argument)
+		process.writeWord(arg_addr, new_str_addr)
+		arg = process.readWord(arg_addr)
+		playWithProcess(process)
+	
+	
+	def fuzz(self, arguments, address):
+		self.arguments = arguments
+   		self.address = address
+		self.mem = None
+		self.pid = traceProgram(self.arguments)
+		self.is_attached = True
+	
+		self.dbg = PtraceDebugger()
+		self.process = self.dbg.addProcess(self.pid, self.is_attached)
+	
+		self.process.createBreakpoint(self.address, None)
+		self.process.setoptions(ptrace_bindings.PTRACE_O_TRACEFORK)
+		
+		self.mem = allocateMemory(self.process)
+		
+		playWithProcess(self.process)
+		
+		ip = self.process.getInstrPointer() - 1
+		breakpoint = self.process.findBreakpoint(ip)
+		if breakpoint:
+		    print ("Stopped at %s" % breakpoint)
+		    breakpoint.desinstall(set_ip=True)
+		
+		for length in range(0, 20):
+			self.test_process = createCheckpoint(self.process)
+			self.try_arg("a" * length)
+			#self.test_process.terminate(True)
+		
+		self.dbg.quit()
 
 if __name__ == "__main__":
-    main()
+    Fuzz().fuzz(argv[2:], int(argv[1], 16))
