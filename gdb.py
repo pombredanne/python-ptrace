@@ -25,6 +25,8 @@ from ptrace.debugger import ChildError
 from ptrace.debugger.memory_mapping import readProcessMappings
 from ptrace.os_tools import RUNNING_PYTHON3
 
+from ptrace.binding import func
+
 import re
 try:
     # Use readline for better raw_input()
@@ -338,12 +340,42 @@ class Gdb(Application):
             self.followterms = []
         elif command == "xray":
             self.xray()
+        elif command == "checkpoint":
+            self.createCheckpoint()
         else:
             errmsg = "Unknown command: %r" % command
         if errmsg:
             print >>stderr, errmsg
             return False
         return True
+
+    def createCheckpoint(self):
+        self.process.setoptions(func.PTRACE_O_TRACEFORK)
+
+        syscall_opcode = "\xCD\x80"
+        fork_syscall_nr = 2
+
+        eip = self.process.getreg("eip")
+        old_eax = self.process.getreg("eax")
+        old_instrs = self.process.readBytes(eip, len(syscall_opcode))
+        self.process.writeBytes(eip, syscall_opcode)
+        self.process.setreg("eax", fork_syscall_nr)
+
+        child = None
+
+        try:
+            self.step(True)
+        except NewProcessEvent, ex:
+            child = ex.process
+            print ex
+
+        self.process.setreg("eax", old_eax)
+        self.process.setreg("eip", eip)
+        self.process.writeBytes(eip, old_instrs)
+
+        child.setreg("eax", old_eax)
+        child.setreg("eip", eip)
+        child.writeBytes(eip, old_instrs)
 
     def parseSignum(self, command):
         try:
